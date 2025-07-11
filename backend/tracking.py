@@ -6,16 +6,34 @@ from models import Activity
 from database import SessionLocal
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+import win32gui
+import win32process
+import psutil
 import os
 
 def log_window_activity(db: Session):
-    active = gw.getActiveWindow()
-    if active:
-        app_name = active._getProcessName() if hasattr(active, '_getProcessName') else 'Unknown'
-        window_title = active.title
-        new_activity = Activity(app_name=app_name, window_title=window_title, type='app')
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        if hwnd == 0:
+            return  # No foreground window
+
+        pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+        process = psutil.Process(pid)
+        app_name = process.name()
+        window_title = win32gui.GetWindowText(hwnd)
+
+        new_activity = Activity(
+            app_name=app_name,
+            window_title=window_title,
+            type='app'
+        )
         db.add(new_activity)
         db.commit()
+
+        print(f"🧠 LOGGED: {app_name} — {window_title}")
+
+    except Exception as e:
+        print(f"❌ Failed to log activity: {e}")
 
 def start_window_tracking():
     def run():
@@ -25,7 +43,7 @@ def start_window_tracking():
                 log_window_activity(db)
             finally:
                 db.close()
-            time.sleep(5)  # Poll every 5s to keep CPU low
+            time.sleep(5)  # Every 5s, low CPU
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()

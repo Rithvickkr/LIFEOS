@@ -12,3 +12,4 @@ pygetwindow
 pywin32
 darts
 openai-whisper
+psutil
