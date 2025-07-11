@@ -1,15 +1,15 @@
 import time
 import threading
-import pygetwindow as gw
-from sqlalchemy.orm import Session
-from models import Activity
-from database import SessionLocal
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 import win32gui
 import win32process
 import psutil
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from sqlalchemy.orm import Session
+from models import Activity
+from database import SessionLocal
 import os
+from memory import process_activity_content  # Import from Step 6 for embedding
 
 def log_window_activity(db: Session):
     try:
@@ -29,8 +29,12 @@ def log_window_activity(db: Session):
         )
         db.add(new_activity)
         db.commit()
+        db.refresh(new_activity)  # Refresh to get ID
 
         print(f"🧠 LOGGED: {app_name} — {window_title}")
+
+        # Embed if relevant (e.g., for content-rich windows; expand as needed)
+        process_activity_content(new_activity)
 
     except Exception as e:
         print(f"❌ Failed to log activity: {e}")
@@ -43,11 +47,10 @@ def start_window_tracking():
                 log_window_activity(db)
             finally:
                 db.close()
-            time.sleep(5)  # Every 5s, low CPU
+            time.sleep(5)  # Poll every 5s, low CPU
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    
 
 class FileHandler(FileSystemEventHandler):
     def __init__(self, db_session):
@@ -58,6 +61,12 @@ class FileHandler(FileSystemEventHandler):
             new_activity = Activity(file_path=event.src_path, type='file_edit')
             self.db_session.add(new_activity)
             self.db_session.commit()
+            self.db_session.refresh(new_activity)  # Refresh for ID
+
+            print(f"🧠 LOGGED FILE: {event.src_path}")
+
+            # Process for embedding (PDFs, media, etc.)
+            process_activity_content(new_activity)
 
 def start_file_tracking(monitored_folder: str):
     # Expand ~ and env vars

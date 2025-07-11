@@ -6,6 +6,7 @@ from database import SessionLocal
 from models import Activity
 from fastapi import Body
 from tracking import start_file_tracking, start_window_tracking
+from memory import collection, embedder
 load_dotenv()
 
 app = FastAPI()
@@ -37,3 +38,9 @@ def track_activity(data: dict = Body(...), db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_activity)
     return {"status": "logged", "id": new_activity.id}
+
+@app.get("/search")
+def search(query: str, top_k: int = 5):
+    query_emb = embedder.encode(query).tolist()
+    results = collection.query(query_embeddings=[query_emb], n_results=top_k)
+    return {"results": results['documents'][0], "metadatas": results['metadatas'][0]}
