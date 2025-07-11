@@ -1,4 +1,4 @@
-fastapi
+fastapi[all]
 uvicorn
 sqlalchemy
 python-dotenv
@@ -13,3 +13,9 @@ pywin32
 darts
 openai-whisper
 psutil
+langchain-community
+together
+langchain-community 
+langchain-huggingface 
+langchain-chroma 
+langchain-together
