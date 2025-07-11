@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+sqlalchemy
+python-dotenv
+psycopg2-binary
+sentence-transformers
+langchain
+chromadb
+pdfplumber
+watchdog
+pygetwindow 
+pywin32
+darts
+openai-whisper
