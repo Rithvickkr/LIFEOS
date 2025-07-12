@@ -73,26 +73,45 @@ def get_timeline(db: Session = Depends(get_db)):
     today = datetime.utcnow().date()
     activities = db.query(Activity).filter(func.date(Activity.timestamp) == today).all()
 
-    # Aggregate by hour and type
+    # Aggregate by hour and calculate hourly focus scores
     timeline_data = {}
-    switches = 0
-    last_app = None
+    hourly_switches = {}
+    hourly_counts = {}
+    last_app_per_hour = {}
+    
     for act in activities:
         hour = act.timestamp.hour
         if hour not in timeline_data:
-            timeline_data[hour] = {'apps': [], 'focus': 100}  # Start high
+            timeline_data[hour] = {'apps': [], 'focus': 100}
+            hourly_switches[hour] = 0
+            hourly_counts[hour] = 0
+            
         timeline_data[hour]['apps'].append(act.app_name or act.type)
+        hourly_counts[hour] += 1
 
-        # Simple focus calc: Count switches
-        if act.app_name and act.app_name != last_app:
-            switches += 1
-            last_app = act.app_name
+        # Count switches per hour
+        if act.app_name:
+            if hour in last_app_per_hour and act.app_name != last_app_per_hour[hour]:
+                hourly_switches[hour] += 1
+            last_app_per_hour[hour] = act.app_name
 
+    # Calculate focus score for each hour
+    for hour in timeline_data:
+        if hourly_counts[hour] > 0:
+            switch_ratio = hourly_switches[hour] / hourly_counts[hour]
+            timeline_data[hour]['focus'] = int((1 - switch_ratio) * 100)
+        else:
+            timeline_data[hour]['focus'] = 100
+         
     # Overall focus score
     total_activities = len(activities)
-    focus_score = max(100 - (switches * 10), 0) if total_activities else 0
+    total_switches = sum(hourly_switches.values())
+    print(f"Total activities today: {total_activities}, Total switches: {total_switches}")  # Debug print
+    switch_ratio = total_switches / total_activities if total_activities > 0 else 0
+    focus_score = int((1 - switch_ratio) * 100)
+    print(f"Overall focus score calculated: {focus_score}")  # Debug print
 
-   # Basic prediction with darts
+    # Basic prediction with darts
     prediction = 0
     if len(activities) >= 2:  # Min for seasonal fit; adjust as needed
         from darts import TimeSeries
