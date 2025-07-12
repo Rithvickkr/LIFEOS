@@ -61,6 +61,20 @@ def process_activity_content(activity):
         elif activity.file_path.endswith(('.mp3', '.mp4', '.wav')):
             content = transcribe_audio_video(activity.file_path)
             source_type = 'media'
+        elif activity.file_path.endswith('.txt'):
+            with open(activity.file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            source_type = 'text'
+        elif activity.file_path.endswith(('.docx', '.doc')):
+            import docx
+            doc = docx.Document(activity.file_path)
+            content = '\n'.join([para.text for para in doc.paragraphs])
+            source_type = 'docx'
+        elif activity.file_path.endswith('.csv'):
+            import pandas as pd
+            df = pd.read_csv(activity.file_path)
+            content = df.to_string(index=False)
+            source_type = 'csv'
     # Add more handlers if needed (e.g., .txt files)
 
     if content:

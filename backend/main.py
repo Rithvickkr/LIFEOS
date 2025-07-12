@@ -4,17 +4,17 @@ from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 import os
 from database import SessionLocal
-from models import Activity
+from models import Activity, Embedding
 from fastapi import Body
 from tracking import start_file_tracking, start_window_tracking
 from memory import collection, embedder
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy import func
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_chroma import Chroma
 from langchain_together import Together as LangChainTogether # For vectorstore
 from langchain_huggingface import HuggingFaceEmbeddings  # For embeddings
-from langchain.chains import RetrievalQA
+from langchain.chains import RetrievalQA, LLMChain
 from langchain.prompts import PromptTemplate
 from together import Together
 
@@ -90,17 +90,21 @@ def get_timeline(db: Session = Depends(get_db)):
     total_activities = len(activities)
     focus_score = max(100 - (switches * 10), 0) if total_activities else 0
 
-    # Basic prediction with darts
+   # Basic prediction with darts
     prediction = 0
-    if activities:
+    if len(activities) >= 2:  # Min for seasonal fit; adjust as needed
         from darts import TimeSeries
         from darts.models import ExponentialSmoothing
         times = [act.timestamp.hour for act in activities]
-        series = TimeSeries.from_values([1] * len(times))  # Dummy series
+        series = TimeSeries.from_values([1] * len(times))  # Dummy
         model = ExponentialSmoothing()
-        model.fit(series)
-        pred_ts = model.predict(1)
-        prediction = float(pred_ts.values()[0][0])  # Convert to Python float for serialization
+        try:
+            model.fit(series)
+            pred_ts = model.predict(1)
+            prediction = float(pred_ts.values()[0][0])
+        except Exception as e:
+            print(f"Darts fit error: {e} - Falling back to 0")
+            prediction = 0  # Fallback if fit fails
 
     return {
         "timeline": timeline_data,
@@ -109,101 +113,168 @@ def get_timeline(db: Session = Depends(get_db)):
     }
 
 together_client = Together(api_key=os.getenv('TOGETHER_API_KEY'))
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-vectorstore = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
+Embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+vectorstore = Chroma(persist_directory="./chroma_db", embedding_function=Embeddings)
 
-@app.get("/insights")
+@app.get("/insightss")
 def get_insights(db: Session = Depends(get_db)):
     # Get today's activities
-    today = datetime.utcnow().date()
-    activities = db.query(Activity).filter(func.date(Activity.timestamp) == today).all()
+    now = datetime.now(timezone.utc)
+    one_hour_ago = now - timedelta(hours=1)
+    activities = db.query(Activity).filter(Activity.timestamp >= one_hour_ago, Activity.timestamp <= now).all()
     activity_summary = " ".join([f"{act.app_name or act.type}: {act.window_title or act.file_path}" for act in activities])
+    print("Past hour's activities summary:", activity_summary)  # Debug print
+    
+    # Get unique activities
+    unique_activities = list(set([act.app_name or act.type for act in activities if act.app_name or act.type]))
+    print("Unique activities:", unique_activities)  # Debug print
 
     # RAG retriever from Chroma
     retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 5})
+    print ("Retriever initialized")  # Debug: Confirm retriever setup
+
+    # Batch question text
+    batch_question = """Answer these questions:
+
+1. What did I learn today?
+2. Where am I weak?
+3. What should I revise?
+
+Only respond with a **valid JSON object** using **double quotes**, like:
+{"1": "answer1", "2": "answer2", "3": "answer3"}
+
+Return ONLY that. Do not add anything else, not even explanation."""
 
     # Prompt template for Llama
     prompt_template = PromptTemplate(
         input_variables=["context", "question"],
-        template="Based on today's activities: {context}\nQuestion: {question}\nAnswer:"
+        template="""You are an AI assistant analyzing a user's daily activities and learning progress.
+
+Based on today's activities and learning materials: {context}
+
+{question}
+
+Instructions:
+- Provide detailed, specific, and actionable insights
+- Base your answers on the actual activities and content provided
+- Be honest if there's insufficient information
+- Focus on concrete learning outcomes and improvement areas
+- Use specific examples from the activities when possible
+
+Answer in the specified JSON format with detailed explanations for each question. Do not add any additional text outside the JSON format.
+
+"""
     )
 
-    # LangChain chain with Llama
+    # LangChain chain with Llama (updated to RunnableSequence: prompt | llm)
     llm = LangChainTogether(
-        model="deepseek-ai/DeepSeek-R1-Distill-Llama-70B-free",
+        model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
         together_api_key=os.getenv('TOGETHER_API_KEY'),
-        max_tokens=1024,
+        max_tokens=2048,
         temperature=0.7
-        
     )
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        chain_type_kwargs={"prompt": prompt_template}
-    )
+    chain = prompt_template | llm  # New way, no LLMChain
 
-    # Generate insights
-    questions = [
-        "What did I learn today?",
-        "Where am I weak?",
-        "What should I revise?"
-    ]
-    insights = {}
-    for q in questions:
-        result = qa_chain.invoke({"query": q + " Activities summary: " + activity_summary})
-        insights[q] = result['result']
+    # Get RAG context
+    docs = retriever.invoke(batch_question + " Activities summary: " + activity_summary + " Unique activities: " + ", ".join(unique_activities))
+    print("Retrieved documents:", docs)
+    context = activity_summary + " " + ", ".join(unique_activities)
+    
+    # Fallback to activity summary if no RAG context found
+    if not context.strip():
+        context = activity_summary
+        print("No RAG context found, using activity summary as context")
+    
+    print("Context generated", context)  # Debug: Check if context is empty
 
-    return {"insights": insights}    
+    # Generate batched insights
+    result = chain.invoke({"context": context, "question": batch_question})
+    print("Raw result from Llama:", result)  # Debug print
+    # Return raw text from LLM without JSON parsing
+    if isinstance(result, str):
+        raw_text = result
+    else:
+        raw_text = result.content if hasattr(result, 'content') else str(result)
+    
+    return {"raw_response": raw_text}
 
 @app.get("/quiz")
-def get_quiz(topic: str = "cybersecurity", num_mcqs: int = 5, db: Session = Depends(get_db)):
+def get_quiz(topic: str = "learning", num_mcqs: int = 5, db: Session = Depends(get_db)):
     print("Entering get_quiz endpoint with topic:", topic, "and num_mcqs:", num_mcqs)  # Debug: Confirm entry
-
-    # Get relevant embeddings (RAG on topic or all)
-    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 10})
-    docs = retriever.invoke(topic or "cybersecurity")
+    print("Using vectorstore:", vectorstore)  # Debug: Check vectorstore setup
+    
+    # Fetch all embeddings from DB for fallback
+    all_embeddings = db.query(Embedding).all()
+    print("Embeddings fetched from DB:", len(all_embeddings))  # Debug: Check DB load
+    if all_embeddings:
+        print("Sample DB text:", all_embeddings[0].text[:100])  # Debug DB content
+    
+    # Rebuild vectorstore if empty (sync with DB)
+    if vectorstore._collection.count() == 0:
+        texts = [emb.text for emb in all_embeddings]
+        vectors = [emb.vector for emb in all_embeddings]
+        vectorstore.add_texts(texts, embeddings=vectors)
+        print("Rebuilt vectorstore from DB - now has:", vectorstore._collection.count())
+    
+    # Retriever with MMR, lower threshold
+    retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 20, "score_threshold": 0.4})  # Lower for more matches
+    print("Retriever initialized for quiz:", retriever)  # Debug
+    
+    # Query: Lowercase for case-insensitivity
+    enhanced_query = topic.lower()
+    docs = retriever.invoke(enhanced_query)
+    print("Docs retrieved:", len(docs))  # Debug
+    if docs:
+        print("Sample doc:", docs[0].page_content[:100])  # Debug
+    
     context = " ".join([doc.page_content for doc in docs])
-    print("Context generated - length:", len(context))  # Debug: Check if context is empty
-
+    print("Context generated - length:", len(context))  # Debug
+    
+    # Fixed fallback: Always use full DB texts if 0 docs
     if not context:
-        print("No context found - returning empty")  # Debug: If early return
-        return {"mcqs": [], "summaries": "No content yet—add some activities!"}
-
-    # Prompt for MCQs and summaries
+        context = " ".join([emb.text for emb in all_embeddings if emb.text])
+        print("Fallback context used - length:", len(context))
+    
+    # Prompt for MCQs and summaries (fixed: escaped JSON with double curly braces)
     prompt_template = PromptTemplate(
-        input_variables=["context"],
-        template="From this content: {context}\nGenerate {num_mcqs} MCQs with 4 options (A-D, one correct), and a 1-liner summary for each key concept. Format as JSON: {'mcqs': [{'question': '', 'options': [], 'answer': ''}], 'summaries': []}"
+        input_variables=["context", "num_mcqs"],
+        template="From this content: {context}\nGenerate {num_mcqs} MCQs with 4 options (A-D, one correct), and a 1-liner summary for each key concept. Format as JSON: {{'mcqs': [{{'question': '', 'options': [], 'answer': ''}}], 'summaries': []}}"
     )
 
     llm = LangChainTogether(
-        model="deepseek-ai/DeepSeek-R1-Distill-Llama-70B-free",  # Corrected name - no "-free", added "ed" in Distilled
+        model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
         together_api_key=os.getenv('TOGETHER_API_KEY'),
         max_tokens=1024,
         temperature=0.7
     )
 
-    chain = prompt_template | llm  # Simple chain
+    chain = prompt_template | llm
 
     result = chain.invoke({"context": context, "num_mcqs": num_mcqs})
-    print("Raw result from Llama:", result.content)  # Your original print, now with debug label
+    
+    # Handle both string and object responses
+    if isinstance(result, str):
+        result_content = result
+    else:
+        result_content = result.content if hasattr(result, 'content') else str(result)
+    
+    print("Raw result from Llama:", result_content)  # Debug
 
     try:
-        output = json.loads(result.content)
-        print("Generated output after parse:", output)  # Your original
+        output = json.loads(result_content)
+        print("Generated output after parse:", output)
 
-        # Fix for summaries
-        if not isinstance(output['summaries'], list):
-            output['summaries'] = [output['summaries']] if output['summaries'] else []
+        # Fix lists
+        if not isinstance(output.get('summaries', []), list):
+            output['summaries'] = [output['summaries']] if output.get('summaries') else []
 
-        # Similar for mcqs
-        if not isinstance(output['mcqs'], list):
-            output['mcqs'] = [output['mcqs']] if output['mcqs'] else []
+        if not isinstance(output.get('mcqs', []), list):
+            output['mcqs'] = [output['mcqs']] if output.get('mcqs') else []
 
-        print("Generated MCQs:", output.get('mcqs', []))  # Your original
-        print("Generated Summaries:", output.get('summaries', []))  # Your original
+        print("Generated MCQs:", output.get('mcqs', []))
+        print("Generated Summaries:", output.get('summaries', []))
     except Exception as e:
-        print("JSON parsing error:", str(e))  # Debug: Catch why try fails
+        print("JSON parsing error:", str(e))
         output = {"mcqs": [], "summaries": []}
 
     return output
