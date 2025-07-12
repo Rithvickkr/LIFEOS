@@ -17,7 +17,9 @@ from langchain_huggingface import HuggingFaceEmbeddings  # For embeddings
 from langchain.chains import RetrievalQA, LLMChain
 from langchain.prompts import PromptTemplate
 from together import Together
-
+import networkx as nx
+import numpy as np
+from networkx.readwrite import json_graph
 load_dotenv()
 
 app = FastAPI()
@@ -278,3 +280,28 @@ def get_quiz(topic: str = "learning", num_mcqs: int = 5, db: Session = Depends(g
         output = {"mcqs": [], "summaries": []}
 
     return output
+@app.get("/mindmap")
+def get_mindmap(db: Session = Depends(get_db)):
+    embeddings = db.query(Embedding).all()
+    if not embeddings:
+        return {"nodes": [], "edges": []}
+
+    G = nx.Graph()
+
+    for emb in embeddings:
+        G.add_node(emb.id, label=emb.text[:20] + "...", full_text=emb.text, activity_id=emb.activity_id)
+
+    # Add edges based on cosine similarity
+    for i in range(len(embeddings)):
+        for j in range(i+1, len(embeddings)):
+            vec1 = np.array(embeddings[i].vector)
+            vec2 = np.array(embeddings[j].vector)
+            sim = np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+            if sim > 0.5:  # Adjust threshold as needed
+                G.add_edge(embeddings[i].id, embeddings[j].id, weight=sim)
+
+    # Convert to React Flow JSON
+    data = json_graph.node_link_data(G)
+    nodes = [{'id': str(node['id']), 'data': {'label': node['label']}, 'position': {'x': 0, 'y': 0}} for node in data['nodes']]  # Random pos later
+    edges = [{'id': f"{edge['source']}-{edge['target']}", 'source': str(edge['source']), 'target': str(edge['target'])} for edge in data['links']]
+    return {"nodes": nodes, "edges": edges}
