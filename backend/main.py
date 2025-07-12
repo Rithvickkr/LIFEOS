@@ -20,6 +20,8 @@ from together import Together
 import networkx as nx
 import numpy as np
 from networkx.readwrite import json_graph
+import PyPDF2
+import docx
 load_dotenv()
 
 app = FastAPI()
@@ -111,21 +113,43 @@ def get_timeline(db: Session = Depends(get_db)):
     focus_score = int((1 - switch_ratio) * 100)
     print(f"Overall focus score calculated: {focus_score}")  # Debug print
 
-    # Basic prediction with darts
+    # Updated prediction with hourly counts
+    from collections import Counter
+    from darts import TimeSeries
+    from darts.models import ExponentialSmoothing
+
+
     prediction = 0
-    if len(activities) >= 2:  # Min for seasonal fit; adjust as needed
-        from darts import TimeSeries
-        from darts.models import ExponentialSmoothing
-        times = [act.timestamp.hour for act in activities]
-        series = TimeSeries.from_values([1] * len(times))  # Dummy
-        model = ExponentialSmoothing()
+
+    if len(activities) >= 2:  # Minimum needed for time series
         try:
+            # Step 1: Count activities per hour
+            hourly_counts = Counter([act.timestamp.hour for act in activities])
+            sorted_hours = sorted(hourly_counts.keys())
+            activity_counts = [hourly_counts[hour] for hour in sorted_hours]
+
+            # Debug: Print hour-wise data
+            print("Hourly Activity Count:")
+            for h, c in zip(sorted_hours, activity_counts):
+                print(f"{h}: {c}")
+
+            # Step 2: Create TimeSeries from activity counts
+            series = TimeSeries.from_values(activity_counts)
+
+            # Step 3: Fit model and predict
+            model = ExponentialSmoothing()
             model.fit(series)
             pred_ts = model.predict(1)
+
             prediction = float(pred_ts.values()[0][0])
+            print(f"Predicted activity count for next hour: {prediction}")
+
         except Exception as e:
-            print(f"Darts fit error: {e} - Falling back to 0")
-            prediction = 0  # Fallback if fit fails
+            print(f"Darts prediction error: {e} - Falling back to 0")
+            prediction = 0
+    else:
+        print("Not enough activities for prediction.")
+        prediction = 0
 
     return {
         "timeline": timeline_data,
@@ -324,3 +348,97 @@ def get_mindmap(db: Session = Depends(get_db)):
     nodes = [{'id': str(node['id']), 'data': {'label': node['label']}, 'position': {'x': 0, 'y': 0}} for node in data['nodes']]  # Random pos later
     edges = [{'id': f"{edge['source']}-{edge['target']}", 'source': str(edge['source']), 'target': str(edge['target'])} for edge in data['links']]
     return {"nodes": nodes, "edges": edges}
+
+@app.get("/files")
+def get_files():
+        """Get all files from the monitored folder with their formats"""
+        monitored_folder = os.getenv('MONITORED_FOLDER')
+        if not monitored_folder or not os.path.exists(monitored_folder):
+            return {"files": [], "error": "Monitored folder not found"}
+        
+        files = []
+        for root, dirs, filenames in os.walk(monitored_folder):
+            for filename in filenames:
+                file_path = os.path.join(root, filename)
+                relative_path = os.path.relpath(file_path, monitored_folder)
+                file_ext = os.path.splitext(filename)[1].lower()
+                file_size = os.path.getsize(file_path)
+                
+                files.append({
+                    "name": filename,
+                    "path": relative_path,
+                    "full_path": file_path,
+                    "format": file_ext,
+                    "size": file_size,
+                    "modified": os.path.getmtime(file_path)
+                })
+        
+        return {"files": files}
+
+@app.post("/query-file")
+def query_file(data: dict = Body(...)):
+        """Query a specific file's content"""
+        file_path = data.get('file_path')
+        query = data.get('query', '')
+        
+        if not file_path or not os.path.exists(file_path):
+            return {"error": "File not found"}
+        
+        # Read file content based on format
+        try:
+            file_ext = os.path.splitext(file_path)[1].lower()
+            content = ""
+            
+            if file_ext in ['.txt', '.md', '.py', '.js', '.html', '.css', '.json', '.xml']:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            elif file_ext == '.pdf':
+                with open(file_path, 'rb') as f:
+                    reader = PyPDF2.PdfReader(f)
+                    content = " ".join([page.extract_text() for page in reader.pages])
+            elif file_ext in ['.doc', '.docx']:
+                doc = docx.Document(file_path)
+                content = " ".join([paragraph.text for paragraph in doc.paragraphs])
+            else:
+                return {"error": f"Unsupported file format: {file_ext}"}
+            
+            if not content.strip():
+                return {"error": "No content could be extracted from file"}
+            
+            # Use LLM to answer query based on file content
+            prompt_template = PromptTemplate(
+                input_variables=["content", "query"],
+                template="""Based on the following file content, answer the user's question:
+
+    File Content:
+    {content}
+
+    User Question: {query}
+
+    Provide a detailed and accurate answer based solely on the file content. If the answer cannot be found in the content, say so clearly."""
+            )
+            
+            llm = LangChainTogether(
+                model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+                together_api_key=os.getenv('TOGETHER_API_KEY'),
+                max_tokens=1024,
+                temperature=0.3
+            )
+            
+            chain = prompt_template | llm
+            result = chain.invoke({"content": content[:4000], "query": query})  # Limit content length
+            
+            if isinstance(result, str):
+                answer = result
+            else:
+                answer = result.content if hasattr(result, 'content') else str(result)
+            
+            return {
+                "file_path": file_path,
+                "query": query,
+                "answer": answer,
+                "content_preview": content[:500] + "..." if len(content) > 500 else content
+            }
+            
+        except Exception as e:
+            return {"error": f"Error processing file: {str(e)}"}
