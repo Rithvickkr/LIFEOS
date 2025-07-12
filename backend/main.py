@@ -3,6 +3,7 @@ from fastapi import FastAPI, Depends
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 import os
+from extracter import extract_and_transcribe_media
 from database import SessionLocal
 from models import Activity, Embedding
 from fastapi import Body
@@ -20,8 +21,7 @@ from together import Together
 import networkx as nx
 import numpy as np
 from networkx.readwrite import json_graph
-import PyPDF2
-import docx
+
 load_dotenv()
 
 app = FastAPI()
@@ -349,96 +349,107 @@ def get_mindmap(db: Session = Depends(get_db)):
     edges = [{'id': f"{edge['source']}-{edge['target']}", 'source': str(edge['source']), 'target': str(edge['target'])} for edge in data['links']]
     return {"nodes": nodes, "edges": edges}
 
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import Chroma
+from langchain.embeddings import HuggingFaceEmbeddings  # Or your embedder
+
+# Global embedder (init outside for reuse)
+embedder = HuggingFaceEmbeddings(model_name='all-MiniLM-L6-v2')
+
 @app.get("/files")
 def get_files():
-        """Get all files from the monitored folder with their formats"""
-        monitored_folder = os.getenv('MONITORED_FOLDER')
-        if not monitored_folder or not os.path.exists(monitored_folder):
-            return {"files": [], "error": "Monitored folder not found"}
-        
-        files = []
-        for root, dirs, filenames in os.walk(monitored_folder):
-            for filename in filenames:
-                file_path = os.path.join(root, filename)
-                relative_path = os.path.relpath(file_path, monitored_folder)
-                file_ext = os.path.splitext(filename)[1].lower()
-                file_size = os.path.getsize(file_path)
-                
-                files.append({
-                    "name": filename,
-                    "path": relative_path,
-                    "full_path": file_path,
-                    "format": file_ext,
-                    "size": file_size,
-                    "modified": os.path.getmtime(file_path)
-                })
-        
-        return {"files": files}
+    """Get all files from the monitored folder with their formats"""
+    monitored_folder = os.getenv('MONITORED_FOLDER')
+    if not monitored_folder or not os.path.exists(monitored_folder):
+        return {"files": [], "error": "Monitored folder not found"}
+    
+    files = []
+    for root, dirs, filenames in os.walk(monitored_folder):
+        for filename in filenames:
+            file_path = os.path.join(root, filename)
+            relative_path = os.path.relpath(file_path, monitored_folder)
+            file_ext = os.path.splitext(filename)[1].lower()
+            file_size = os.path.getsize(file_path)
+            
+            files.append({
+                "name": filename,
+                "path": relative_path,
+                "full_path": file_path,
+                "format": file_ext,
+                "size": file_size,
+                "modified": os.path.getmtime(file_path)
+            })
+    
+    return {"files": files}
 
 @app.post("/query-file")
 def query_file(data: dict = Body(...)):
-        """Query a specific file's content"""
-        file_path = data.get('file_path')
-        query = data.get('query', '')
+    """Query a specific file's content using RAG after extraction/transcription"""
+    file_path = data.get('file_path')
+    query = data.get('query', '')
+    
+    if not file_path or not os.path.exists(file_path):
+        return {"error": "File not found"}
+    
+    try:
+        # Extract/transcribe content
+        content = extract_and_transcribe_media(file_path)
         
-        if not file_path or not os.path.exists(file_path):
-            return {"error": "File not found"}
+        if not content:
+            return {"error": "No content could be extracted/transcribed"}
         
-        # Read file content based on format
-        try:
-            file_ext = os.path.splitext(file_path)[1].lower()
-            content = ""
-            
-            if file_ext in ['.txt', '.md', '.py', '.js', '.html', '.css', '.json', '.xml']:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-            elif file_ext == '.pdf':
-                with open(file_path, 'rb') as f:
-                    reader = PyPDF2.PdfReader(f)
-                    content = " ".join([page.extract_text() for page in reader.pages])
-            elif file_ext in ['.doc', '.docx']:
-                doc = docx.Document(file_path)
-                content = " ".join([paragraph.text for paragraph in doc.paragraphs])
-            else:
-                return {"error": f"Unsupported file format: {file_ext}"}
-            
-            if not content.strip():
-                return {"error": "No content could be extracted from file"}
-            
-            # Use LLM to answer query based on file content
-            prompt_template = PromptTemplate(
-                input_variables=["content", "query"],
-                template="""Based on the following file content, answer the user's question:
+        # RAG: Split into chunks
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = text_splitter.split_text(content)
+        
+        # Temp vectorstore
+        vectorstore = Chroma.from_texts(
+            texts=chunks,
+            embedding=embedder,
+            collection_name="temp_media_query"
+        )
+        
+        # Retrieve relevant chunks
+        retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 5})
+        relevant_chunks = retriever.invoke(query)
+        rag_context = " ".join([doc.page_content for doc in relevant_chunks])
+        
+        if not rag_context:
+            rag_context = content[:2000]  # Fallback
+        
+        # LLM query
+        prompt_template = PromptTemplate(
+            input_variables=["context", "query"],
+            template="""Based on the following extracted/transcribed content, answer the question:
 
-    File Content:
-    {content}
+Content: {context}
 
-    User Question: {query}
+Question: {query}
 
-    Provide a detailed and accurate answer based solely on the file content. If the answer cannot be found in the content, say so clearly."""
-            )
-            
-            llm = LangChainTogether(
-                model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
-                together_api_key=os.getenv('TOGETHER_API_KEY'),
-                max_tokens=1024,
-                temperature=0.3
-            )
-            
-            chain = prompt_template | llm
-            result = chain.invoke({"content": content[:4000], "query": query})  # Limit content length
-            
-            if isinstance(result, str):
-                answer = result
-            else:
-                answer = result.content if hasattr(result, 'content') else str(result)
-            
-            return {
-                "file_path": file_path,
-                "query": query,
-                "answer": answer,
-                "content_preview": content[:500] + "..." if len(content) > 500 else content
-            }
-            
-        except Exception as e:
-            return {"error": f"Error processing file: {str(e)}"}
+Answer based solely on the content. If not found, say so."""
+        )
+        
+        llm = LangChainTogether(
+            model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+            together_api_key=os.getenv('TOGETHER_API_KEY'),
+            max_tokens=1024,
+            temperature=0.3
+        )
+        
+        chain = prompt_template | llm
+        result = chain.invoke({"context": rag_context, "query": query})
+        
+        answer = result.content if hasattr(result, 'content') else str(result)
+        
+        # Clean temp vectorstore
+        vectorstore.delete_collection()
+        
+        return {
+            "file_path": file_path,
+            "query": query,
+            "answer": answer,
+            "content_preview": content[:500] + "..." if len(content) > 500 else content
+        }
+    
+    except Exception as e:
+        return {"error": f"Error: {str(e)}"}

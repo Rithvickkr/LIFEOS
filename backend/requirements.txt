@@ -19,3 +19,6 @@ langchain-community
 langchain-huggingface 
 langchain-chroma 
 langchain-together
+moviepy 
+pyPDF2 
+python-docx
